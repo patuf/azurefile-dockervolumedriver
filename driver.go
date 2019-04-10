@@ -24,6 +24,7 @@ type volumeDriver struct {
 	storageBase  string
 	mountpoint   string
 	removeShares bool
+	mountReqCnts map[string]int
 }
 
 func newVolumeDriver(accountName, accountKey, storageBase, mountpoint, metadataRoot string, removeShares bool) (*volumeDriver, error) {
@@ -43,6 +44,7 @@ func newVolumeDriver(accountName, accountKey, storageBase, mountpoint, metadataR
 		storageBase:  storageBase,
 		mountpoint:   mountpoint,
 		removeShares: removeShares,
+		mountReqCnts: make(map[string]int),
 	}, nil
 }
 
@@ -121,6 +123,7 @@ func (v *volumeDriver) Mount(req volume.MountRequest) (resp volume.Response) {
 	logctx.Debug("request accepted")
 
 	path := v.pathForVolume(req.Name)
+
 	if err := os.MkdirAll(path, 0700); err != nil {
 		resp.Err = fmt.Sprintf("could not create mount point: %v", err)
 		logctx.Error(resp.Err)
@@ -137,6 +140,14 @@ func (v *volumeDriver) Mount(req volume.MountRequest) (resp volume.Response) {
 	if meta.Account != v.accountName {
 		resp.Err = fmt.Sprintf("volume hosted on a different account ('%s') cannot mount", meta.Account)
 		logctx.Error(resp.Err)
+		return
+	}
+
+	v.mountReqCnts[path]++
+	logctx.Debug(fmt.Sprintf("Mount: Current number of active mount requests for mountpoint \"%v\" (including this one): %v", path, v.mountReqCnts[path]))
+	if v.mountReqCnts[path] > 1 {
+		logctx.Debug(fmt.Sprintf("Mount: Mountpoint \"%v\" already mounted. Skipping mount operation.", path))
+		resp.Mountpoint = path
 		return
 	}
 
@@ -160,40 +171,32 @@ func (v *volumeDriver) Unmount(req volume.UnmountRequest) (resp volume.Response)
 
 	logctx.Debug("request accepted")
 	path := v.pathForVolume(req.Name)
+
+	v.mountReqCnts[path]--
+	logctx.Debug(fmt.Sprintf("Unmount: Current number of active mount requests for mountpoint \"%v\" (excluding this one): %v", path, v.mountReqCnts[path]))
+
+	if v.mountReqCnts[path] < 0 {
+		logctx.Warn(fmt.Sprintf("Unmount: Less than zero active mount requests for mountpoint \"%v\" - docker issued more umnount commands for the same volume, than mounts! Forcing the counter to 0.", path))
+		v.mountReqCnts[path] = 0
+	}
+
+	if v.mountReqCnts[path] >= 1 {
+		logctx.Debug(fmt.Sprintf("Unmount: there are still active mount requests for mountpoint \"%v\", skipping actual unmount operation", path))
+		return
+	}
+
 	if err := unmount(path); err != nil {
 		resp.Err = err.Error()
 		logctx.Error(resp.Err)
 		return
 	}
-	logctx.Debug("unmount successful")
+	logctx.Debug("unmount successful, removing the mountpoint")
 
-	// Docker does not keep track of what is mounted and what is not, it will
-	// issue /Volume.Mount and /Volume.Unmount requests regardless when multiple
-	// containers use the same volume simulatenosly. This leads to duplicate
-	// mount entries and requirement for a careful cleanup of the mountpath in
-	// the following code.
-	//
-	// If same path is mounted multiple times, duplicate entries will occur
-	// in mount table for the same mountpoint. umount will remove the mount
-	// entry but the mountpoint will still be active (and mounted).
-	//
-	// In that case, we read the mount table to see if there is still something
-	// mounted, and only when there is nothing mounted, we remove the mountpoint
-	isActive, err := isMounted(path)
-	if err != nil {
-		resp.Err = err.Error()
+	// When there are no active mount requests, we remove the local folder too
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		resp.Err = fmt.Sprintf("error removing mountpoint: %v", err)
 		logctx.Error(resp.Err)
 		return
-	}
-	if isActive {
-		logctx.Debug("mountpoint still has active mounts, not removing")
-	} else {
-		logctx.Debug("mountpoint has no further mounts, removing")
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			resp.Err = fmt.Sprintf("error removing mountpoint: %v", err)
-			logctx.Error(resp.Err)
-			return
-		}
 	}
 	return
 }
